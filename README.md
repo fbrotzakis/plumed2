@@ -32,41 +32,98 @@ only to compare with old simulations); output component `sigmaMean-<group>`.
 Compared with the old branch, the forces with `REWEIGHT` and different replica weights, `biasDer`, the neighbor list and
 PBMETAD (stretched Gaussians) also follow the corrections of current PLUMED master: do not restart from HILLS/GRID files of old runs.
 
-### Build PLUMED
+### Tested software
+
+| Component | Version used for testing |
+|---|---|
+| OS | Ubuntu 26.04 (glibc 2.43), x86_64 |
+| Compilers | GCC/G++ 15.2 |
+| MPI | Open MPI 5.0 (`openmpi-bin`, `libopenmpi-dev`) |
+| Libraries | zlib (`zlib1g-dev`), FFTW 3 (`libfftw3-dev`, optional for PLUMED) |
+| Build tools | GNU make, `patch`, CMake 4.2 (GROMACS needs >= 3.28) |
+| CUDA toolkit | 13.5 from conda-forge (see below), NVIDIA driver 580 (CUDA 13.0); GPU RTX 4090 (sm_89) |
+| GROMACS | 2026.4 (PLUMED patches are also provided for 2025.0 and 2024.3) |
+
+On Ubuntu/Debian:
 
 ```bash
+sudo apt install build-essential gfortran cmake openmpi-bin libopenmpi-dev zlib1g-dev libfftw3-dev patch git
+```
+
+### 1. Build PLUMED
+
+```bash
+git clone -b emmi-sem-master https://github.com/fbrotzakis/plumed2.git plumed2-memmi
+cd plumed2-memmi
 ./configure --prefix=$HOME/opt/plumed-memmi --enable-mpi CXX=mpic++
 make -j 16 && make install
+# environment (add to a file you source, NOT to ~/.bashrc if other PLUMED versions are set there)
+export PATH=$HOME/opt/plumed-memmi/bin:$PATH
+export LD_LIBRARY_PATH=$HOME/opt/plumed-memmi/lib:$LD_LIBRARY_PATH
+export PLUMED_KERNEL=$HOME/opt/plumed-memmi/lib/libplumedKernel.so
 ```
 
-### Run with GROMACS on the GPU
+EMMI is in the `isdb` module, which is compiled by default.
 
-Use GROMACS 2026.4 (also 2025.0 and 2024.3 are supported) built with CUDA, so that the nonbonded and PME
-interactions run on the GPU while PLUMED runs on the CPU:
+### 2. CUDA toolkit
+
+GROMACS must be built with CUDA: it refuses OpenCL on NVIDIA Volta and newer GPUs. CUDA 12.4 and older
+cannot compile with glibc 2.41 or newer. If the system CUDA is too old, install a recent toolkit in an
+isolated conda environment (nothing is installed system-wide; the toolkit minor version may be newer than
+the one the driver reports, e.g. CUDA 13.5 runs on a CUDA 13.0 driver):
 
 ```bash
-export PATH=$HOME/opt/plumed-memmi/bin:$PATH
+conda create -y -p $HOME/opt/cuda13 -c conda-forge --override-channels \
+      cuda-nvcc=13.5 cuda-cudart-dev=13.5 cuda-profiler-api libcufft-dev cuda-version=13.5
+```
+
+(`cuda-profiler-api` provides `cuda_profiler_api.h`, needed by GROMACS.)
+
+### 3. Patch and build GROMACS 2026.4 with CUDA
+
+```bash
+wget https://ftp.gromacs.org/gromacs/gromacs-2026.4.tar.gz
 tar xzf gromacs-2026.4.tar.gz && cd gromacs-2026.4
-plumed patch -p -e gromacs-2026.4
+plumed patch -p -e gromacs-2026.4          # plumed from step 1 must be in PATH
 mkdir build && cd build
-cmake .. -DGMX_MPI=ON -DGMX_GPU=CUDA -DGMX_BUILD_OWN_FFTW=ON -DCMAKE_INSTALL_PREFIX=$HOME/opt/gromacs-2026.4-plumed
+C=$HOME/opt/cuda13
+cmake .. -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DGMX_MPI=ON -DGMX_GPU=CUDA \
+      -DCMAKE_CUDA_COMPILER=$C/bin/nvcc -DCMAKE_CUDA_HOST_COMPILER=$(which g++) -DCUDAToolkit_ROOT=$C \
+      -DCMAKE_CUDA_ARCHITECTURES=89 -DGMX_BUILD_OWN_FFTW=ON -DGMX_HWLOC=OFF \
+      -DCMAKE_INSTALL_RPATH=$C/lib -DCMAKE_INSTALL_PREFIX=$HOME/opt/gromacs-2026.4-plumed-cuda
 make -j 16 && make install
 ```
 
-GROMACS 2025 and newer load PLUMED at run time from `PLUMED_KERNEL`: set it explicitly, otherwise
-a different PLUMED (e.g. one set in `~/.bashrc`) is loaded silently. Check the first lines of `PLUMED.OUT`.
+Set `CMAKE_CUDA_ARCHITECTURES` for your GPU (89 = RTX 40xx/L40, 80 = A100, 90 = H100). Check with
+`gmx_mpi --version` that it reports `GPU support: CUDA`.
+
+GROMACS 2025 and newer load PLUMED at run time from `PLUMED_KERNEL`: always set it explicitly, otherwise
+another PLUMED (e.g. one set in `~/.bashrc`) is loaded silently. Check the first lines of `PLUMED.OUT`.
+
+### 4. Run MEMMI
+
+Run with MPI ranks and **one OpenMP thread per rank**, e.g. 8 replicas with 4 ranks each
+(GROMACS puts 3 PP ranks and 1 PME rank per replica; nonbonded and PME on the GPU):
 
 ```bash
-export PLUMED_KERNEL=$HOME/opt/plumed-memmi/lib/libplumedKernel.so
-mpirun -np 8 gmx_mpi mdrun -multidir r{0..7} -plumed ../plumed.dat -nb gpu -pme gpu -update cpu -ntomp 3
+export OMP_NUM_THREADS=1
+mpirun -np 32 gmx_mpi mdrun -s topol.tpr -multidir r{0..7} -plumed ../plumed.dat \
+       -ntomp 1 -npme 1 -nb gpu -pme gpu -update cpu
 ```
 
-Notes:
+Important:
 
-- use a CUDA build: GROMACS does not use OpenCL on NVIDIA Volta or newer GPUs;
-- `-update cpu`: PLUMED forces are applied on the CPU at every step;
-- CUDA 12.4 and older cannot compile with glibc 2.41 or newer: use CUDA 12.9 or newer
-  (e.g. in a separate conda environment: `conda create -n cuda129 -c conda-forge cuda-nvcc=12.9 cuda-cudart-dev=12.9 libcufft-dev cuda-version=12.9`).
+- **`-ntomp 1`**: with PLUMED master and more than one OpenMP thread per rank, EMMI runs crash with a
+  segmentation fault in the GROMACS pair search (memory corruption; reproduced with unmodified upstream PLUMED,
+  on CPU and GPU, so it is not caused by the SEM code). The GROMACS 2026.4 patch passes the GROMACS thread count
+  to PLUMED; with one thread per rank PLUMED runs serially, as with older PLUMED versions.
+- **`-update cpu`**: PLUMED forces are applied on the CPU at every step.
+- **No energy groups** (`energygrps`) in the `.mdp`: GROMACS does not run nonbonded interactions on the GPU with energy groups.
+- **Alignment with the cryo-EM map**: EMMI with `NOPBC` compares absolute coordinates, so the protein in the `.tpr`,
+  the MOLINFO/`ADDREFERENCE` structure and the GMM file must be in the same (map) frame. Build the box without moving
+  the protein (`gmx editconf -box ... -noc`, not `-c`, which shifts it). `WHOLEMOLECULES ... ADDREFERENCE` only picks
+  the periodic image of each chain closest to the reference, it cannot undo a shift that is not a box vector.
+- Do not restart from HILLS/GRID files written by the old `emmi-bias-sigmasem` branch (see above).
 
 Branches and releases
 ---------------------
