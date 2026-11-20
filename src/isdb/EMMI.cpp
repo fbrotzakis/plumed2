@@ -112,9 +112,44 @@ emr: BIASVALUE ARG=gmm.scoreb STRIDE=2
 PRINT ARG=emr.* FILE=COLVAR STRIDE=500 FMT=%20.10f
 ```
 
+## Metadynamics and the uncertainty in the mean estimate
+
+In a multi-replica simulation the ensemble average of the model overlaps is estimated from a finite number of replicas.
+With the OPTSIGMAMEAN flag the uncertainty in this estimate (the standard error of the mean, $\sigma_{SEM}$) is computed on the fly
+from the (weighted) spread of the model overlaps across replicas and added to the uncertainty of each group of GMM components,
+in quadrature, so that the noise model uses $\sqrt{\sigma^2 + s^2\,\sigma_{SEM}^2}$, where $s$ is the regression scale (one with no REGRESSION).
+As in [METAINFERENCE](METAINFERENCE.md) with a single sigma, $\sigma_{SEM}$ of a group is the largest standard error of the mean
+of the overlaps of its GMM components, and the Monte Carlo sampling of sigma uses the same total uncertainty as the energy.
+A starting value must be given with SIGMA_MEAN0. If AVERAGING is set, $\sigma_{SEM}$ is the maximum of the estimates over the last AVERAGING steps,
+otherwise it is the maximum over the whole simulation. The estimate is not updated when the effective number of replicas is one.
+The current value is available as the component `sigmaMean-<group>`.
+The flag SEM_LEGACY reproduces the original implementation (the noise model used $\sigma + s\,\sigma_{SEM}$, group $i$ used the overlap of GMM component $i$ only,
+the Monte Carlo of sigma ignored $\sigma_{SEM}$ and OUTLIERS was normalized with $\sigma$): use it only to compare with old simulations.
+OPTSIGMAMEAN requires two or more replicas with ensemble averaging, and it is typically combined with Parallel-Bias Metadynamics
+and the REWEIGHT flag:
+
+```plumed
+MOLINFO STRUCTURE=prot.pdb
+protein-h: GROUP NDX_FILE=index.ndx NDX_GROUP=Protein-H
+phi: TORSION ATOMS=5,7,9,15
+psi: TORSION ATOMS=7,9,15,17
+
+pb: PBMETAD ARG=phi,psi SIGMA=0.3,0.3 HEIGHT=0.5 PACE=500 BIASFACTOR=8 TEMP=300 WALKERS_MPI
+
+gmm: EMMI ...
+   NOPBC TEMP=300 NL_STRIDE=100 NL_CUTOFF=0.01 GMM_FILE=GMM_fit.dat ATOMS=protein-h
+   SIGMA0=0.5 SIGMA_MIN=0.01 DSIGMA=0.01 RESOLUTION=0.1 NOISETYPE=GAUSS
+   REWEIGHT ARG=pb.bias AVERAGING=200
+   OPTSIGMAMEAN SIGMA_MEAN0=0.05
+...
+
+emr: BIASVALUE ARG=gmm.scoreb STRIDE=2
+PRINT ARG=gmm.* FILE=COLVAR STRIDE=500
+```
+
 ## Restart
 
-With [CHECKPOINT](CHECKPOINT.md) sigma, the Monte Carlo state, the regression scale and the average weights are stored in the checkpoint and the status file is trimmed and not read. The neighbor list is rebuilt at the first step: the restart is exactly reproducible when the neighbor list is updated at that step (e.g. with `NL_STRIDE=1`). A file of the model overlaps (`WRITE_OV`) of a previous run is never appended to: it is renamed as a backup.
+With [CHECKPOINT](CHECKPOINT.md) sigma, the Monte Carlo state, the regression scale, the average weights and (with OPTSIGMAMEAN) the uncertainty in the mean estimate and its history are stored in the checkpoint and the status file is trimmed and not read. The neighbor list is rebuilt at the first step: the restart is exactly reproducible when the neighbor list is updated at that step (e.g. with `NL_STRIDE=1`). A file of the model overlaps (`WRITE_OV`) of a previous run is never appended to: it is renamed as a backup.
 
 */
 //+ENDPLUMEDOC
@@ -226,6 +261,23 @@ private:
   double decay_w_;
   std::vector<double> average_weights_;
 
+  // sigma_mean is the uncertainty in the mean estimate (standard error of the mean, SEM)
+  bool do_optsigmamean_;
+  std::vector<double> sigma_mean2_;
+  // history of sigma_mean^2 used to optimize sigma_mean
+  std::vector<std::vector<double> > sigma_mean2_last_;
+  unsigned optsigmamean_stride_;
+  // reproduce the original SEM implementation (T. Loehr, branch emmi-bias-sigmasem)
+  bool sem_legacy_;
+  // total uncertainty of group i given its sigma s and the (scaled) uncertainty in the mean estimate,
+  // added in quadrature as in METAINFERENCE (the original SEM implementation added them linearly)
+  double sigma_eff(unsigned i, double s) const {
+    if(sem_legacy_) {
+      return s + scale_ * std::sqrt(sigma_mean2_[i]);
+    }
+    return std::sqrt(s * s + scale_ * scale_ * sigma_mean2_[i]);
+  }
+
 // write file with model overlap
   void write_model_overlap(long long int step);
 // get median of std::vector
@@ -286,6 +338,8 @@ private:
 
   // See MetainferenceBase
   void get_weights(double &weight, double &norm, double &neff);
+  // estimate sigma_mean on the fly
+  void get_sigma_mean(double weight, double norm, double neff, const std::vector<double> &mean);
 
 public:
   static void registerKeywords( Keywords& keys );
@@ -461,6 +515,9 @@ void EMMI::registerKeywords( Keywords& keys ) {
   keys.add("optional","WRITE_OV","write a file with model overlaps");
   keys.add("optional","AVERAGING", "Averaging window for weights");
   keys.add("optional","SEED","seed of the random number generator used by the Monte Carlo sampling (by default it is taken from the clock at every run)");
+  keys.add("optional","SIGMA_MEAN0","starting value for the uncertainty in the mean estimate");
+  keys.addFlag("OPTSIGMAMEAN",false,"Set to estimate sigma_mean (the standard error of the mean) on the fly");
+  keys.addFlag("SEM_LEGACY",false,"with OPTSIGMAMEAN, reproduce the original implementation of the uncertainty in the mean estimate (sigma and sigma_mean are added linearly, group i uses the overlap of GMM component i, the Monte Carlo of sigma ignores it, OUTLIERS is normalized with sigma only); only to compare with old simulations");
   keys.addFlag("NO_AVER",false,"don't do ensemble averaging in multi-replica mode");
   keys.addFlag("REWEIGHT",false,"simple REWEIGHT using the ARG as energy");
   keys.addOutputComponent("scoreb","default","scalar","Bayesian score");
@@ -473,6 +530,7 @@ void EMMI::registerKeywords( Keywords& keys ) {
   keys.addOutputComponent("biasDer",      "REWEIGHT","scalar",     "derivatives with respect to the bias");
   keys.addOutputComponent("sigma",      "NOISETYPE","scalar",     "uncertainty in the forward models and experiment");
   keys.addOutputComponent("neff",         "default","scalar",      "effective number of replicas");
+  keys.addOutputComponent("sigmaMean",    "OPTSIGMAMEAN","scalar",  "uncertainty in the mean estimate");
   keys.addDOI("10.1101/113951");
   keys.addDOI("10.1126/sciadv.1501177");
 }
@@ -491,7 +549,8 @@ EMMI::EMMI(const ActionOptions&ao):
   nregres_(0), scale_(1.),
   dpcutoff_(15.0), nexp_(1000000), nanneal_(0),
   kanneal_(0.), anneal_(1.), prior_(1.), ovstride_(0),
-  do_reweight_(false), first_time_w_(true), decay_w_(1.) {
+  do_reweight_(false), first_time_w_(true), decay_w_(1.),
+  do_optsigmamean_(false), optsigmamean_stride_(0), sem_legacy_(false) {
   // periodic boundary conditions
   bool nopbc=!pbc_;
   parseFlag("NOPBC",nopbc);
@@ -662,6 +721,21 @@ EMMI::EMMI(const ActionOptions&ao):
   parse("AVERAGING", averaging);
   if(averaging>0) {
     decay_w_ = 1./static_cast<double> (averaging);
+    optsigmamean_stride_ = averaging;
+  }
+
+  parseFlag("OPTSIGMAMEAN", do_optsigmamean_);
+  double read_sigma_mean = 0.0;
+  parse("SIGMA_MEAN0", read_sigma_mean);
+  if(do_optsigmamean_ && read_sigma_mean <= 0.0 && !getRestart()) {
+    error("If you use OPTSIGMAMEAN and you are not RESTARTING then you MUST SET SIGMA_MEAN0");
+  }
+  if(do_optsigmamean_ && (no_aver_ || nrep_<2)) {
+    error("OPTSIGMAMEAN requires ensemble averaging with 2 or more replicas");
+  }
+  parseFlag("SEM_LEGACY", sem_legacy_);
+  if(sem_legacy_ && !do_optsigmamean_) {
+    error("SEM_LEGACY can be used only with OPTSIGMAMEAN");
   }
 
   int seed=-1;
@@ -709,6 +783,12 @@ EMMI::EMMI(const ActionOptions&ao):
   log.printf("  prior exponent : %f\n",prior_);
   log.printf("  number of replicas for averaging: %u\n",nrep_);
   log.printf("  id of the replica : %u\n",replica_);
+  if(do_optsigmamean_) {
+    log.printf("  uncertainty in the mean estimate optimized on the fly, starting value : %f\n", read_sigma_mean);
+    if(sem_legacy_) {
+      log.printf("  WARNING: SEM_LEGACY, original implementation of the uncertainty in the mean estimate (only to compare with old simulations)\n");
+    }
+  }
   if(nanneal_>0) {
     log.printf("  length of annealing cycle : %u\n",nanneal_);
     log.printf("  annealing factor : %f\n",kanneal_);
@@ -794,6 +874,18 @@ EMMI::EMMI(const ActionOptions&ao):
     }
   }
 
+  // sigma_mean
+  if(read_sigma_mean > 0.0 && do_optsigmamean_) {
+    sigma_mean2_.resize(GMM_d_grps_.size(), read_sigma_mean * read_sigma_mean);
+  } else {
+    sigma_mean2_.resize(GMM_d_grps_.size(), 0.0);
+  }
+  // history of sigma_mean, initialized with the starting value
+  sigma_mean2_last_.resize(GMM_d_grps_.size());
+  for(unsigned j=0; j<GMM_d_grps_.size(); ++j) {
+    sigma_mean2_last_[j].push_back(sigma_mean2_[j]);
+  }
+
   // read status file if restarting
   // (with a checkpoint sigma is read from it and the status file is trimmed)
   if(getRestart() && noise_!=2 && !from_checkpoint) {
@@ -842,6 +934,16 @@ EMMI::EMMI(const ActionOptions&ao):
     componentIsNotPeriodic("biasDer");
     addComponent("weight");
     componentIsNotPeriodic("weight");
+  }
+
+  if(do_optsigmamean_) {
+    for(unsigned i=0; i<sigma_mean2_.size(); ++i) {
+      std::string num;
+      Tools::convert(i, num);
+      addComponent("sigmaMean-"+num);
+      componentIsNotPeriodic("sigmaMean-"+num);
+      getPntrToComponent("sigmaMean-"+num)->set(std::sqrt(sigma_mean2_[i]));
+    }
   }
 
   addComponent("neff");
@@ -941,6 +1043,16 @@ void EMMI::writeCheckpoint(CheckpointWriter& w) {
   w.write("scale",scale_);
   w.write("average_weights",average_weights_);
   w.write("first_time_w",(long long) first_time_w_);
+  if(do_optsigmamean_) {
+    w.write("sigma_mean2",sigma_mean2_);
+    // history: one length per group followed by the flattened values
+    std::vector<double> h;
+    for(const auto & last : sigma_mean2_last_) {
+      h.push_back(static_cast<double>(last.size()));
+      h.insert(h.end(), last.begin(), last.end());
+    }
+    w.write("sigma_mean2_last",h);
+  }
   std::vector<double> v;
   for(unsigned i=0; i<getNumberOfComponents(); ++i) {
     v.push_back(copyOutput(i)->get());
@@ -969,6 +1081,29 @@ void EMMI::readCheckpoint(CheckpointReader& r) {
   long long ft;
   r.read("first_time_w",ft);
   first_time_w_=ft!=0;
+  if(do_optsigmamean_) {
+    r.read("sigma_mean2",v);
+    if(v.size()!=sigma_mean2_.size()) {
+      error("the checkpoint was written with a different number of sigma_mean");
+    }
+    sigma_mean2_=v;
+    r.read("sigma_mean2_last",v);
+    std::size_t k=0;
+    for(auto & last : sigma_mean2_last_) {
+      if(k>=v.size()) {
+        error("the checkpoint was written with a different number of sigma_mean");
+      }
+      const std::size_t n=static_cast<std::size_t>(v[k++]);
+      if(k+n>v.size()) {
+        error("the checkpoint was written with a different number of sigma_mean");
+      }
+      last.assign(v.begin()+k, v.begin()+k+n);
+      k+=n;
+    }
+    if(k!=v.size()) {
+      error("the checkpoint was written with a different number of sigma_mean");
+    }
+  }
   r.read("components",v);
   if(v.size()!=getNumberOfComponents()) {
     error("the checkpoint was written with a different number of components");
@@ -1076,10 +1211,16 @@ void EMMI::doMonteCarloMove() {
   if(new_s < sigma_min_[nGMM]) {
     new_s = 2.0 * sigma_min_[nGMM] - new_s;
   }
+  // total uncertainty with the old and new sigma, as in the energy of calculate():
+  // with OPTSIGMAMEAN it includes the uncertainty in the mean estimate
+  // (the original SEM implementation used sigma only)
+  const bool with_sem = do_optsigmamean_ && !sem_legacy_;
+  const double old_st = with_sem ? sigma_eff(nGMM, sigma_[nGMM]) : sigma_[nGMM];
+  const double new_st = with_sem ? sigma_eff(nGMM, new_s) : new_s;
   // old s2
-  double old_inv_s2 = 1.0 / sigma_[nGMM] / sigma_[nGMM];
+  double old_inv_s2 = 1.0 / old_st / old_st;
   // new s2
-  double new_inv_s2 = 1.0 / new_s / new_s;
+  double new_inv_s2 = 1.0 / new_st / new_st;
 
   // cycle on GMM group and calculate old and new energy
   double old_ene = 0.0;
@@ -1114,8 +1255,8 @@ void EMMI::doMonteCarloMove() {
       new_ene += std::log1p( 0.5 * dev * dev * new_inv_s2);
     }
     // final energy calculation: add normalization and prior
-    old_ene = kbt_ * ( old_ene + (ng+prior_) * std::log(sigma_[nGMM]) );
-    new_ene = kbt_ * ( new_ene + (ng+prior_) * std::log(new_s) );
+    old_ene = kbt_ * ( old_ene + (ng+prior_) * std::log(old_st) );
+    new_ene = kbt_ * ( new_ene + (ng+prior_) * std::log(new_st) );
   }
 
   // accept or reject
@@ -1791,6 +1932,85 @@ void EMMI::get_weights(double &weight, double &norm, double &neff) {
   getPntrToComponent("neff")->set(neff);
 }
 
+void EMMI::get_sigma_mean(const double weight, const double norm, const double neff, const std::vector<double> &mean) {
+  if(!do_optsigmamean_) {
+    return;
+  }
+  const unsigned ngrps = GMM_d_grps_.size();
+  // current estimate of sigma_mean^2 for each group
+  std::vector<double> sigma_mean2_now(ngrps,0.0);
+  // is the history updated at this step?
+  bool update = true;
+  if(sem_legacy_) {
+    // original implementation (T. Loehr, branch emmi-bias-sigmasem):
+    // group i uses the overlap of GMM component i, and there is no check on neff
+    if(rank_==0) {
+      for(unsigned i=0; i<ngrps; ++i) {
+        sigma_mean2_now[i] = weight*(ovmd_[i]-mean[i])*(ovmd_[i]-mean[i]);
+      }
+      multi_sim_comm.Sum(&sigma_mean2_now[0], ngrps);
+    }
+    comm.Sum(&sigma_mean2_now[0], ngrps);
+    for(unsigned i=0; i<ngrps; ++i) {
+      sigma_mean2_now[i] *= 1.0/(neff-1.)/norm;
+    }
+  } else {
+    // weighted variance of the model overlap of each GMM component across replicas
+    std::vector<double> var(ovmd_.size(),0.0);
+    if(rank_==0) {
+      for(unsigned i=0; i<ovmd_.size(); ++i) {
+        var[i] = weight*(ovmd_[i]-mean[i])*(ovmd_[i]-mean[i]);
+      }
+      multi_sim_comm.Sum(&var[0], var.size());
+    }
+    if(size_>1) {
+      comm.Sum(&var[0], var.size());
+    }
+    // the standard error of the mean is not defined with a single effective replica:
+    // in that case the history is not updated (as in METAINFERENCE)
+    update = (neff>1.);
+    if(update) {
+      // as in METAINFERENCE with a single sigma: the maximum over the members of the group
+      // of the squared standard error of the mean of each GMM component
+      for(unsigned i=0; i<ngrps; ++i) {
+        for(unsigned j=0; j<GMM_d_grps_[i].size(); ++j) {
+          const double sm2 = var[GMM_d_grps_[i][j]]/(neff-1.)/norm;
+          if(sm2>sigma_mean2_now[i]) {
+            sigma_mean2_now[i] = sm2;
+          }
+        }
+      }
+    }
+  }
+  // add sigma_mean2 to history
+  if(update) {
+    if(optsigmamean_stride_>0) {
+      // remove first entry of the history std::vector
+      if(sigma_mean2_last_[0].size()==optsigmamean_stride_) {
+        for(unsigned i=0; i<ngrps; ++i) {
+          sigma_mean2_last_[i].erase(sigma_mean2_last_[i].begin());
+        }
+      }
+      for(unsigned i=0; i<ngrps; ++i) {
+        sigma_mean2_last_[i].push_back(sigma_mean2_now[i]);
+      }
+    } else {
+      for(unsigned i=0; i<ngrps; ++i) {
+        if(sigma_mean2_now[i] > sigma_mean2_last_[i][0]) {
+          sigma_mean2_last_[i][0] = sigma_mean2_now[i];
+        }
+      }
+    }
+  }
+  // set to the maximum in history std::vector
+  for(unsigned i=0; i<ngrps; ++i) {
+    sigma_mean2_[i] = *std::max_element(sigma_mean2_last_[i].begin(), sigma_mean2_last_[i].end());
+    std::string num;
+    Tools::convert(i, num);
+    getPntrToComponent("sigmaMean-"+num)->set(std::sqrt(sigma_mean2_[i]));
+  }
+}
+
 void EMMI::calculate() {
 
 // calculate CV
@@ -1836,6 +2056,9 @@ void EMMI::calculate() {
     // set scale component
     getPntrToComponent("scale")->set(scale_);
   }
+
+  // estimate sigma_mean
+  get_sigma_mean(weight, norm, neff, ovmd_ave_);
 
   // write model overlap to file
   if(ovstride_>0 && step%ovstride_==0) {
@@ -1993,45 +2216,53 @@ void EMMI::calculate_Gauss() {
   // cycle on all the GMM groups
   for(unsigned i=0; i<GMM_d_grps_.size(); ++i) {
     double eneg = 0.0;
+    // total uncertainty: sigma plus the (scaled) uncertainty in the mean estimate
+    const double sigma_temp = sigma_eff(i, sigma_[i]);
     // cycle on all the members of the group
     for(unsigned j=0; j<GMM_d_grps_[i].size(); ++j) {
       // id of the GMM component
       int GMMid = GMM_d_grps_[i][j];
       // calculate deviation
-      double dev = ( scale_*ovmd_ave_[GMMid]-ovdd_[GMMid] ) / sigma_[i];
+      double dev = ( scale_*ovmd_ave_[GMMid]-ovdd_[GMMid] ) / sigma_temp;
       // add to group energy
       eneg += 0.5 * dev * dev;
       // store derivative for later
-      GMMid_der_[GMMid] = kbt_ * dev / sigma_[i];
+      GMMid_der_[GMMid] = kbt_ * dev / sigma_temp;
     }
     // add to total energy along with normalizations and prior
-    ene_ += kbt_ * ( eneg + (static_cast<double>(GMM_d_grps_[i].size())+prior_) * std::log(sigma_[i]) );
+    ene_ += kbt_ * ( eneg + (static_cast<double>(GMM_d_grps_[i].size())+prior_) * std::log(sigma_temp) );
   }
 }
 
 void EMMI::calculate_Outliers() {
   // cycle on all the GMM groups
   for(unsigned i=0; i<GMM_d_grps_.size(); ++i) {
+    // total uncertainty: sigma plus the (scaled) uncertainty in the mean estimate
+    const double sigma_temp = sigma_eff(i, sigma_[i]);
     // cycle on all the members of the group
     double eneg = 0.0;
     for(unsigned j=0; j<GMM_d_grps_[i].size(); ++j) {
       // id of the GMM component
       int GMMid = GMM_d_grps_[i][j];
       // calculate deviation
-      double dev = ( scale_*ovmd_ave_[GMMid]-ovdd_[GMMid] ) / sigma_[i];
+      double dev = ( scale_*ovmd_ave_[GMMid]-ovdd_[GMMid] ) / sigma_temp;
       // add to group energy
       eneg += std::log1p( 0.5 * dev * dev );
       // store derivative for later
-      GMMid_der_[GMMid] = kbt_ / ( 1.0 + 0.5 * dev * dev ) * dev / sigma_[i];
+      GMMid_der_[GMMid] = kbt_ / ( 1.0 + 0.5 * dev * dev ) * dev / sigma_temp;
     }
     // add to total energy along with normalizations and prior
-    ene_ += kbt_ * ( eneg + (static_cast<double>(GMM_d_grps_[i].size())+prior_) * std::log(sigma_[i]) );
+    // (the original SEM implementation normalized with sigma only)
+    const double snorm = sem_legacy_ ? sigma_[i] : sigma_temp;
+    ene_ += kbt_ * ( eneg + (static_cast<double>(GMM_d_grps_[i].size())+prior_) * std::log(snorm) );
   }
 }
 
 void EMMI::calculate_Marginal() {
   // cycle on all the GMM groups
   for(unsigned i=0; i<GMM_d_grps_.size(); ++i) {
+    // total uncertainty: sigma_min plus the (scaled) uncertainty in the mean estimate
+    const double smin = sigma_eff(i, sigma_min_[i]);
     // cycle on all the members of the group
     for(unsigned j=0; j<GMM_d_grps_[i].size(); ++j) {
       // id of the GMM component
@@ -2040,16 +2271,16 @@ void EMMI::calculate_Marginal() {
       double dev = ( scale_*ovmd_ave_[GMMid]-ovdd_[GMMid] );
       if(dev==0.0) {
         // limit for dev -> 0: erf(dev/sqrt(2)/smin)/dev -> sqrt(2/pi)/smin, and zero derivative
-        ene_ += -kbt_ * std::log ( 0.5 * sqrt2_pi_ / sigma_min_[i] );
+        ene_ += -kbt_ * std::log ( 0.5 * sqrt2_pi_ / smin );
         GMMid_der_[GMMid] = 0.0;
         continue;
       }
       // calculate errf
-      double errf = erf ( dev * inv_sqrt2_ / sigma_min_[i] );
+      double errf = erf ( dev * inv_sqrt2_ / smin );
       // add to group energy
       ene_ += -kbt_ * std::log ( 0.5 / dev * errf ) ;
       // store derivative for later
-      GMMid_der_[GMMid] = - kbt_/errf*sqrt2_pi_*std::exp(-0.5*dev*dev/sigma_min_[i]/sigma_min_[i])/sigma_min_[i]+kbt_/dev;
+      GMMid_der_[GMMid] = - kbt_/errf*sqrt2_pi_*std::exp(-0.5*dev*dev/smin/smin)/smin+kbt_/dev;
     }
   }
 }
