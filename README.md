@@ -11,6 +11,63 @@
 [![Spack package](https://repology.org/badge/version-for-repo/spack/plumed.svg)](https://repology.org/project/plumed/versions)
 [![Bluesky](https://img.shields.io/bluesky/followers/plumed.org?label=Follow)](https://bsky.app/profile/plumed.org)
 
+MEMMI: EMMI with the uncertainty in the mean estimate (this fork)
+-----------------------------------------------------------------
+
+This repository (`fbrotzakis/plumed2`) is PLUMED master plus the uncertainty in the mean estimate
+(standard error of the mean, SEM) for [EMMI](https://www.plumed.org/doc-master/user-doc/html/EMMI/),
+as used in Metainference/MEMMI simulations of cryo-EM maps with Parallel-Bias Metadynamics and reweighting
+(see [fbrotzakis/MEMMI](https://github.com/fbrotzakis/MEMMI) for the input files).
+
+It ports the original implementation by T. Löhr (`tlhr/plumed2`, branch `emmi-bias-sigmasem`) and corrects it:
+
+- the SEM of a group of GMM components is the largest SEM of its components (as in METAINFERENCE with a single sigma);
+  the original used the overlap of GMM component *i* for group *i*;
+- sigma and SEM are added in quadrature, `sqrt(sigma^2 + scale^2 SEM^2)` (the original added them linearly);
+- the Monte Carlo of sigma uses the same total uncertainty as the energy, and OUTLIERS is normalized with it;
+- the SEM is not updated when the effective number of replicas is one.
+
+New EMMI keywords: `OPTSIGMAMEAN`, `SIGMA_MEAN0` and `SEM_LEGACY` (reproduces the original implementation exactly,
+only to compare with old simulations); output component `sigmaMean-<group>`.
+Compared with the old branch, the forces with `REWEIGHT` and different replica weights, `biasDer`, the neighbor list and
+PBMETAD (stretched Gaussians) also follow the corrections of current PLUMED master: do not restart from HILLS/GRID files of old runs.
+
+### Build PLUMED
+
+```bash
+./configure --prefix=$HOME/opt/plumed-memmi --enable-mpi CXX=mpic++
+make -j 16 && make install
+```
+
+### Run with GROMACS on the GPU
+
+Use GROMACS 2026.4 (also 2025.0 and 2024.3 are supported) built with CUDA, so that the nonbonded and PME
+interactions run on the GPU while PLUMED runs on the CPU:
+
+```bash
+export PATH=$HOME/opt/plumed-memmi/bin:$PATH
+tar xzf gromacs-2026.4.tar.gz && cd gromacs-2026.4
+plumed patch -p -e gromacs-2026.4
+mkdir build && cd build
+cmake .. -DGMX_MPI=ON -DGMX_GPU=CUDA -DGMX_BUILD_OWN_FFTW=ON -DCMAKE_INSTALL_PREFIX=$HOME/opt/gromacs-2026.4-plumed
+make -j 16 && make install
+```
+
+GROMACS 2025 and newer load PLUMED at run time from `PLUMED_KERNEL`: set it explicitly, otherwise
+a different PLUMED (e.g. one set in `~/.bashrc`) is loaded silently. Check the first lines of `PLUMED.OUT`.
+
+```bash
+export PLUMED_KERNEL=$HOME/opt/plumed-memmi/lib/libplumedKernel.so
+mpirun -np 8 gmx_mpi mdrun -multidir r{0..7} -plumed ../plumed.dat -nb gpu -pme gpu -update cpu -ntomp 3
+```
+
+Notes:
+
+- use a CUDA build: GROMACS does not use OpenCL on NVIDIA Volta or newer GPUs;
+- `-update cpu`: PLUMED forces are applied on the CPU at every step;
+- CUDA 12.4 and older cannot compile with glibc 2.41 or newer: use CUDA 12.9 or newer
+  (e.g. in a separate conda environment: `conda create -n cuda129 -c conda-forge cuda-nvcc=12.9 cuda-cudart-dev=12.9 libcufft-dev cuda-version=12.9`).
+
 Branches and releases
 ---------------------
 
